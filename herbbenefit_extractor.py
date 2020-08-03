@@ -1,95 +1,70 @@
 #!/usr/local/bin/python3
 
-from sklearn.preprocessing import LabelEncoder
+import numpy as np
+import pandas as pd
+
 import tensorflow as tf
-from keras.layers import Dense, Input, Dropout
-from tensorflow.python.keras import models, optimizers, losses, activations
-from keras.layers.normalization import BatchNormalization
-from keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.model_selection import train_test_split 
-import csv
-import re
+import tensorflow_hub as hub
 
-sentences , labels = [], []
-with open('herbbenefits-training.csv','r')as f:
-    data = csv.reader(f)
-    for row in data:
-        sentences.append(row[0])
-        labels.append(row[1])
+import pprint
+
+from sklearn.preprocessing import MultiLabelBinarizer
+
+data = pd.read_csv('herbbenefits-training.csv')
+
+descriptions = data['sentence']
+genres = data['benefits']
 
 
+#print(sentences)
 
-sentences = [re.sub(r'.,:?{}', ' ', sentence) for sentence in sentences]
+f = open('labels2', 'r')
 
-corpus = " ".join(sentences)
-words = set(doc.split())
-word_index = {word: index for index, word in enumerate(words)}
-with open( 'word_index.json' , 'w' ) as file:
-    json.dump( word_index , file )
- 
-LE = LabelEncoder()
- 
- 
-def train_and_eval(sentences, label):
- 
-    # converting categorical label
-    labels = LE.fit_transform(labels)
-    labels = np.array( labels )
-    num_classes = len(labels)
-    onehot_labels = tf.keras.utils.to_categorical(labels ,    
-                                                  num_classes=num_classes)
-    
-    setences_tokens = [sentence.split() for sentence in sentences]
-    tokenizer = tf.keras.preprocessing.text.Tokenizer()
-    tokenizer.word_index = word_index
-    sentences_features = tokenizer.texts_to_matrix(setences_tokens)
- 
-    train_features, val_features, train_labels, val_labels =  train_test_split(sentences_features, onehot_labels, test_size = 0.1) 
-    feature_input = Input(shape=(sentences_features.shape[1],))
-    dense = Dense(128, activation=activations.relu) 
-    merged = BatchNormalization()(dense)
-    merged = Dropout(0.2)(merged)
-    merged = Dense(64, activation=activations.relu)(merged)
-    merged = BatchNormalization()(merged)
-    merged = Dropout(0.2)(merged)
-    preds = Dense(num_classes, activation=activations.softmax)(merged)
-    model = Model(inputs=[word_input], outputs=preds)
- 
-    model.compile(loss=losses.categorical_crossentropy,  
-                  optimizer='nadam', metrics=['acc'])
- 
-    early_stopping = EarlyStopping(monitor='val_loss', patience=5)
-    model.fit([train_features], train_labels,        
-               validation_data=([val_features], val_labels),
-               epochs=200, batch_size=8, shuffle=True,
-                callbacks=[early_stopping])
-    model.save('models.h5')
+top_genres = f.readlines()
 
-	
-def test(sentence, model_path, word_index_path):
-    classifier = models.load_model( 'models/models.h5' )
-    tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='.,:?{} ')
-    sentences = re.sub(r'.,:?{}', ' ', sentence)
-    with open(word_index_path, 'r') as f:
-        tokenizer.word_index = json.loads(f.read())
-        tokenized_messages = tokenizer.texts_to_matrix(sentence.split())
-        p = list(classifier.predict(tokenized_messages)[0])
- 
-    for index, each in enumerate(p):
-        print(index, each)
+#print(top_genres)
 
-'''
-def convert_model_to_tflite(keras_model_path):
- 
-    tf.logging.set_verbosity( tf.logging.ERROR )
-    converter = tf.contrib.lite.TFLiteConverter.from_keras_model_file(
- 
-                                                 keras_model_path )
- 
-    converter.post_training_quantize = True
-    tflite_buffer = converter.convert()
-    open( 'model.tflite' , 'wb' ).write( tflite_buffer )
- 
-    print( 'TFLite model created.')
+train_size = int(len(descriptions) * .8)
 
-'''
+train_descriptions = descriptions[:train_size]
+train_genres = genres[:train_size]
+
+test_descriptions = descriptions[train_size:]
+test_genres = genres[train_size:]
+
+description_embeddings = hub.text_embedding_column(
+  "movie_descriptions", 
+  module_spec="https://tfhub.dev/google/universal-sentence-encoder/2"
+)
+
+
+encoder = MultiLabelBinarizer()
+encoder.fit_transform(train_genres)
+train_encoded = encoder.transform(train_genres)
+test_encoded = encoder.transform(test_genres)
+num_classes = len(encoder.classes_)
+
+multi_label_head = tf.contrib.estimator.multi_label_head(
+    num_classes,
+    loss_reduction=tf.losses.Reduction.SUM_OVER_BATCH_SIZE
+)
+
+estimator = tf.contrib.estimator.DNNEstimator(
+    head=multi_label_head,
+    hidden_units=[64,10],
+    feature_columns=[description_embeddings]
+)
+
+# Format our data for the numpy_input_fn
+features = {
+  "descriptions": np.array(train_descriptions)
+}
+labels = np.array(train_encoded)
+
+train_input_fn = tf.estimator.inputs.numpy_input_fn(
+    features, 
+    labels, 
+    shuffle=True, 
+    batch_size=32, 
+    num_epochs=20
+)
